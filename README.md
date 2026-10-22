@@ -1,8 +1,25 @@
 # AI DevOps Assistant
 
-A local starter app that receives GitHub Actions `workflow_run` failure webhooks, verifies their HMAC signature, deduplicates runs, fetches failed job metadata and logs, redacts common secrets, and stores a structured diagnosis for a small dashboard. Fixes are recommendations only; this app does not edit code or open pull requests.
+Pipeline Pulse monitors failed GitHub Actions runs. GitHub sends a signed notice when a workflow fails; the assistant fetches that run's job details and logs, redacts common secrets, asks OpenAI for a concise summary, likely cause, and suggested fix, then saves the result in the signed-in user's private history. It only recommends fixes: it does not edit code, open pull requests, or deploy changes.
 
-## Run locally
+## Deploy on Netlify
+
+The Netlify version uses Netlify Identity for sign-in, Netlify Blobs for durable account-scoped data, and Netlify Functions for the API, signed webhook, and background log analysis. User API credentials are encrypted with AES-256-GCM before they are written to storage. They are never sent to the browser after saving. Redacted failure-log excerpts are sent to OpenAI for diagnosis.
+
+1. Import the private `dadasahil/ai-devops-assistant` GitHub repository into a **new Netlify site**. Do not reuse the unrelated `aigalaxy2` site. Leave the publish directory as `static` and build command as `npm run build` (these are already in `netlify.toml`).
+2. Enable Netlify Identity on that site and use **invite-only** registration. Invite the site's owner account, then confirm the invitation email and sign in. Do not enable public sign-up for a personal dashboard.
+3. In Netlify's site environment variables, set these secret values:
+   - `CREDENTIAL_ENCRYPTION_KEY`: 32 random bytes encoded as Base64.
+   - `BACKGROUND_JOB_SECRET`: a separate long random secret used only to protect the private background worker.
+   - `GITHUB_WEBHOOK_SECRET`: a separate long random secret used to verify GitHub's signature.
+   - Optional: `LLM_MODEL` (defaults to `gpt-4o-mini`).
+4. Deploy the site. Sign in, paste the OpenAI API key and a fine-grained GitHub token with **Actions: Read-only** access, select the intended repository, and choose **Connect both**. Do not paste either key into chat or GitHub source files.
+5. In that repository's GitHub settings, add or update a webhook to `https://YOUR-SITE.netlify.app/webhooks/github`, with content type `application/json`, the exact `GITHUB_WEBHOOK_SECRET` value, and only the **Workflow runs** event. GitHub must be able to reach this public HTTPS URL.
+6. Run a workflow in the repository. Failed runs appear in the dashboard with a summary, cause, and suggested fix. The dashboard refreshes the account's saved history; it does not create a GitHub workflow run.
+
+The encryption key must be retained unchanged. If it is lost or rotated, saved provider keys cannot be decrypted; users can reconnect them. The GitHub webhook secret must match the value stored in Netlify. Netlify Identity and environment variables must be configured in the site's dashboard; their values must never be committed to Git.
+
+## Run the original local Python version
 
 Requires Python 3.10+.
 
@@ -12,42 +29,16 @@ py -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-```
-
-Set `GITHUB_WEBHOOK_SECRET` in `.env`. The dashboard has one **Connect both** button for the OpenAI key and GitHub Actions token. Leave a field empty to reuse a key already saved on this computer. Keys are verified before saving and are kept in `.env.local`, which is excluded from Git.
-
-Create an API key at <https://platform.openai.com/api-keys> and a fine-grained GitHub token with **Actions: Read-only** for the repository you want to monitor. Enter the matching token under **GitHub Actions log access**; the dashboard detects its repository access automatically. If the token covers multiple repositories, select the one to monitor from the detected list. Redacted workflow log excerpts are sent to OpenAI when a failure is analyzed.
-
-```powershell
 uvicorn main:app --reload
 ```
 
-Open <http://127.0.0.1:8000>. The dashboard shows real failed workflow runs received from GitHub. Health is at `/health`, API docs at `/docs`.
+Open <http://127.0.0.1:8000>. The local version stores its keys in `.env.local` and data in a local SQLite file. It is for local learning and is not the backend used by the Netlify deployment.
 
-## Connect GitHub
+## Security and behavior
 
-1. Create a fine-grained token that selects your repository and grants **Actions: Read-only**. Enter the token in the dashboard and choose **Connect both**. Repository access is discovered through GitHub's API; if several repositories are available, choose one from the detected list.
-2. In that repository, add a webhook with URL `https://YOUR_PUBLIC_HOST/webhooks/github`, content type `application/json`, the same random secret as `GITHUB_WEBHOOK_SECRET`, and the **Workflow runs** event.
-3. Make the backend reachable over HTTPS. For local development, use an authenticated development tunnel; do not expose an unauthenticated laptop server.
-4. The assistant uses the saved token to fetch logs for failed runs received from GitHub. It never sends the token back to the browser.
-5. Trigger a harmless failed workflow in a test repository. The endpoint accepts only signed `workflow_run` events with a completed failure conclusion and deduplicates by run ID.
-
-Example `.env` values:
-
-```dotenv
-GITHUB_WEBHOOK_SECRET=your-long-random-webhook-secret
-GITHUB_TOKEN=github_app_installation_token_or_limited_test_token
-LLM_API_KEY=your_provider_api_key
-```
-
-## Important limits
-
-- A GitHub webhook event includes workflow metadata, not the log archive. The backend uses the GitHub REST API to retrieve logs.
-- This starter is a local single-user prototype. Do not deploy it publicly as-is: the dashboard has no login, the storage is local SQLite, and its settings endpoints are restricted to localhost. Public deployment needs authentication and persistent storage.
-- Secret redaction is best-effort. Review data handling and provider terms before sending private logs to an LLM.
-- SQLite is for local learning. Add a managed database, a durable background queue, rate limits, retention controls, and observability before production use.
-- No automatic patch, branch, pull request, merge, or deployment is performed.
-
-## Security notes
-
-Webhook signature verification runs before payload parsing. Analyses are idempotent by workflow run ID. Logs are not persisted; only bounded redacted evidence is saved. The dashboard is intended for localhost and has no login in this starter, so do not expose it publicly until authentication and persistent storage are added.
+- A valid GitHub HMAC signature is checked before a webhook event is parsed or accepted.
+- Only completed failed workflow runs are recorded. Run IDs are deduplicated.
+- Raw workflow logs are held in memory only long enough to analyze; common secrets are redacted before the excerpt is sent to OpenAI. Redaction is best-effort, so review private logs and provider policies before connecting a repository.
+- Each signed-in account sees only its own saved credentials and analysis history. Secrets are encrypted with a site-level key before storage.
+- GitHub and OpenAI credentials require the user's own valid API access. OpenAI API usage may be billed by OpenAI; a valid key alone does not guarantee that the account has API credits.
+- Recommendations are advisory. Check the actual workflow evidence and verify changes yourself.
