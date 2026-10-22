@@ -1,0 +1,7 @@
+.env
+.env.tunnel
+.env.local
+*.db
+*.log
+__pycache__/
+.venv/
