@@ -23,16 +23,20 @@ Copy-Item .env.example .env
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. The local dashboard has no sign-in. Enter:
+Open <http://127.0.0.1:8000>. The local dashboard has no sign-in. In **Connections**, choose an AI provider, enter its model and API key, then click **Connect AI**. Supported choices are:
 
-1. The app owner configures a Gemini API key privately as `GEMINI_API_KEY` in the ignored `.env.local` file or the server environment. The dashboard does not ask users for an AI key. The key stays on the server and must never be added to `static/`, `.env.example`, or a committed file.
-2. Paste a fine-grained GitHub token with access to the repository and **Actions: Read-only** permission. Choose the repository detected from the token.
-3. Click **Connect GitHub**. The app checks the GitHub token and tests its built-in Gemini connection. The Gemini check may use a small amount of API quota.
-4. Click **Refresh**. It checks GitHub for recent workflow failures, saves any it has not seen, and starts diagnosis. Open a failure card to read its summary, cause, and suggested fix.
+- **Google Gemini**, using Google's OpenAI-compatible chat endpoint.
+- **OpenAI**, using its official API endpoint.
+- **Anthropic Claude**, using Anthropic's Messages API.
+- **Other OpenAI-compatible provider**, where you provide its public HTTPS API base URL and a model it supports. This includes gateways and services that implement the OpenAI chat-completions format.
 
-For local use, the app owner’s Gemini key is stored in the ignored `.env.local` file or a private server environment variable; a user’s GitHub token is stored in `.env.local`. Analysis history is stored in the ignored `devops_assistant.db` SQLite file. None of these values belong in Git. Redacted failure-log excerpts are sent to Google Gemini for diagnosis. Secret redaction is best-effort. Disconnecting removes the GitHub token while keeping the app owner’s Gemini configuration.
+An API key only works with the provider and models that issued or accept it. A Claude or OpenAI key cannot call Gemini by itself; a compatible gateway must explicitly offer that Gemini model. Arbitrary API protocols are not interchangeable, so an unlisted service needs to support the OpenAI-compatible chat-completions format. The connection check sends a small real generation request and may use provider quota.
 
-If the provider reports no quota or credits, the GitHub failure can still be captured and shown, but a full AI diagnosis cannot run. Check that Google AI Studio has available Gemini API quota, then click **Retry diagnosis** on the saved failure.
+Then paste a fine-grained GitHub token with access to the repository and **Actions: Read-only** permission, choose a repository detected from that token, and click **Connect GitHub**. Click **Refresh** to check recent workflow failures and start diagnosis. Open a failure card to read its summary, cause, and suggested fix.
+
+For local use, the selected AI key and GitHub token are stored in the ignored `.env.local` file on this computer; this local dashboard has no sign-in, so keep the server bound to localhost. The hosted Netlify version stores each signed-in user's keys encrypted in that user's private connection record. Analysis history is stored in the ignored `devops_assistant.db` SQLite file locally. Redacted failure-log excerpts are sent to the selected AI provider for diagnosis; redaction is best-effort. **Disconnect AI** removes the selected key while keeping GitHub access and saved history.
+
+If the provider reports no quota or credits, the GitHub failure can still be captured and shown, but a full AI diagnosis cannot run. Check quota with that provider, then click **Check AI** or **Retry diagnosis** on the saved failure.
 
 ### Optional instant notifications
 
@@ -40,12 +44,12 @@ Refresh works by polling GitHub, so a webhook is optional. To receive failures w
 
 ## Netlify hosting
 
-The hosted version uses Netlify Functions, encrypted per-user GitHub credentials, and invite-only Netlify Identity to protect private workflow history and repository access. It requires Netlify Blobs, Identity, and these site environment variables:
+The hosted version uses Netlify Functions, encrypted per-user GitHub and AI credentials, and invite-only Netlify Identity to protect private workflow history and repository access. Each signed-in user connects their own AI key in the dashboard. It requires Netlify Blobs, Identity, and these site environment variables:
 
 - `CREDENTIAL_ENCRYPTION_KEY`: 32 random bytes encoded as Base64.
 - `BACKGROUND_JOB_SECRET`: a separate long random secret for internal analysis jobs.
 - `GITHUB_WEBHOOK_SECRET`: a separate secret for the optional GitHub webhook.
-- Optional provider overrides: `LLM_BASE_URL` and `LLM_MODEL`.
+- Optional default provider settings: `AI_PROVIDER`, `LLM_BASE_URL`, and `LLM_MODEL`.
 
 For manual deployment, build with `npm run build`, publish `static`, and deploy the Netlify Functions in `netlify/functions`. Configure the required site services and secrets before expecting hosted analysis to work. The public hosted site must remain access-controlled; removing access control would expose saved repository logs and would let visitors use your provider quota.
 

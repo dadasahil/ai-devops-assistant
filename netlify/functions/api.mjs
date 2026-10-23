@@ -1,7 +1,8 @@
 import { verifyRequestOrigin } from "@netlify/identity";
 import {
-  analysisKey, getConfig, isRepoName, json, listAnalyses, listGithubRepositories, readJson,
+  analysisKey, aiConnectionStatus, getConfig, isRepoName, json, listAnalyses, listGithubRepositories, readJson,
   repoKey, requireUser, saveConfig, store, updateAnalysis, verifyAIKey, verifyGithubToken, writeJson,
+  shouldKeepAISettings,
 } from "./lib.js";
 
 function apiPath(request) {
@@ -87,8 +88,9 @@ export default async function handler(request) {
     try {
       const config = await getConfig(user.id);
       const ai = config.aiKey
-        ? { connected: config.aiVerified, message: config.aiMessage || "AI key is saved but has not been verified. Click Connect both to test it." }
-        : { connected: false, message: "No AI provider key is saved." };
+        ? { configured: true, connected: config.aiVerified, status: aiConnectionStatus(config.aiVerified, config.aiMessage), provider: config.aiProvider, model: config.aiModel,
+            message: config.aiMessage || "AI key is saved but has not been verified. Click Check AI to test it." }
+        : { configured: false, connected: false, provider: config.aiProvider, model: config.aiModel, status: "not_configured", message: "No AI provider key is saved." };
       const discovery = config.githubToken ? await listGithubRepositories(config.githubToken) : { repositories: [], error: null };
       const repositories = discovery.repositories;
       let repository = config.repository;
@@ -106,7 +108,7 @@ export default async function handler(request) {
         : repository
           ? await verifyGithubToken(config.githubToken, repository)
           : { connected: false, message: config.githubToken ? "Choose a repository available to this token." : "No GitHub token is saved." };
-      return json({ ai, ai_base_url: config.aiBaseUrl, ai_model: config.aiModel, github, repository, repositories });
+      return json({ ai, ai_provider: config.aiProvider, ai_base_url: config.aiBaseUrl, ai_model: config.aiModel, github, repository, repositories });
     } catch (error) {
       return json({ detail: error.message || "Could not read connection settings." }, 500);
     }
@@ -120,12 +122,17 @@ export default async function handler(request) {
       const old = await getConfig(user.id);
       const aiKey = String(body.ai_key || "").trim() || old.aiKey;
       const githubToken = String(body.github_token || "").trim() || old.githubToken;
-      const aiBaseUrl = String(body.ai_base_url || old.aiBaseUrl).trim();
-      const aiModel = String(body.ai_model || old.aiModel).trim();
+      const aiProvider = String(body.ai_provider || old.aiProvider).trim().toLowerCase();
+      const aiBaseUrl = aiProvider === "openai_compatible"
+        ? String(body.ai_base_url ?? (old.aiProvider === aiProvider ? old.aiBaseUrl : "")).trim()
+        : aiProvider === "gemini" ? "https://generativelanguage.googleapis.com/v1beta/openai"
+          : aiProvider === "openai" ? "https://api.openai.com/v1"
+            : aiProvider === "anthropic" ? "https://api.anthropic.com/v1" : "";
+      const aiModel = String(body.ai_model ?? (aiProvider === old.aiProvider ? old.aiModel : "")).trim();
       if (aiKey.length > 500 || /[\r\n]/.test(aiKey)) return json({ detail: "The AI provider key format is invalid." }, 400);
       if (githubToken.length > 500 || /[\r\n]/.test(githubToken)) return json({ detail: "The GitHub token format is invalid." }, 400);
 
-      const ai = await verifyAIKey(aiKey, aiBaseUrl, aiModel);
+      const ai = await verifyAIKey(aiKey, aiProvider, aiBaseUrl, aiModel);
       const discovery = githubToken ? await listGithubRepositories(githubToken) : { repositories: [], error: null };
       const repositories = discovery.repositories;
       let repository = String(body.repository || "").trim();
@@ -139,16 +146,18 @@ export default async function handler(request) {
         github = { connected: false, message: "Choose a repository shown in the detected list." };
       } else github = await verifyGithubToken(githubToken, repository);
 
+      const keepAI = shouldKeepAISettings(ai);
       const newConfig = {
-        aiKey: ai.connected ? aiKey : old.aiKey,
+        aiKey: keepAI ? aiKey : old.aiKey,
         githubToken: github.connected ? githubToken : old.githubToken,
         repository: github.connected ? repository : old.repository,
-        aiBaseUrl: ai.connected ? aiBaseUrl : old.aiBaseUrl,
-        aiModel: ai.connected ? aiModel : old.aiModel,
-        aiVerified: ai.connected ? true : (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel ? false : old.aiVerified),
-        aiMessage: ai.connected ? ai.message : (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel ? ai.message : old.aiMessage),
+        aiProvider: keepAI ? aiProvider : old.aiProvider,
+        aiBaseUrl: keepAI ? aiBaseUrl : old.aiBaseUrl,
+        aiModel: keepAI ? aiModel : old.aiModel,
+        aiVerified: ai.connected ? true : (keepAI ? false : old.aiVerified),
+        aiMessage: keepAI ? ai.message : old.aiMessage,
       };
-      if (ai.connected || github.connected || (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel)) await saveConfig(user.id, newConfig);
+      if (keepAI || github.connected || (aiKey === old.aiKey && aiProvider === old.aiProvider && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel)) await saveConfig(user.id, newConfig);
 
       if (github.connected) {
         if (old.repository && old.repository.toLowerCase() !== repository.toLowerCase()) {
@@ -158,9 +167,38 @@ export default async function handler(request) {
         await writeJson(repoKey(repository), { userId: user.id, repository, updatedAt: new Date().toISOString() });
       }
 
-      return json({ ai, ai_base_url: newConfig.aiBaseUrl, ai_model: newConfig.aiModel, github, repository: github.connected ? repository : "", repositories });
+      const responseAI = { ...ai, configured: Boolean(newConfig.aiKey), status: aiConnectionStatus(ai.connected, ai.message), saved: keepAI };
+      return json({ ai: responseAI, ai_attempt: Object.prototype.hasOwnProperty.call(body, "ai_key") || Object.prototype.hasOwnProperty.call(body, "ai_provider") ? responseAI : undefined,
+        ai_provider: newConfig.aiProvider, ai_base_url: newConfig.aiBaseUrl, ai_model: newConfig.aiModel,
+        github, repository: github.connected ? repository : "", repositories });
     } catch (error) {
       return json({ detail: error.message || "Could not save the connection settings." }, 500);
+    }
+  }
+
+  if (request.method === "POST" && path === "/settings/ai/check") {
+    try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
+    try {
+      const config = await getConfig(user.id);
+      if (!config.aiKey) return json({ configured: false, connected: false, status: "not_configured", message: "No AI provider key is saved." });
+      const result = await verifyAIKey(config.aiKey, config.aiProvider, config.aiBaseUrl, config.aiModel);
+      const updated = { ...config, aiVerified: result.connected, aiMessage: result.message };
+      await saveConfig(user.id, updated);
+      return json({ ...result, configured: true, provider: config.aiProvider, model: config.aiModel,
+        status: aiConnectionStatus(result.connected, result.message), saved: shouldKeepAISettings(result) });
+    } catch (error) {
+      return json({ detail: error.message || "Could not check the AI provider." }, 500);
+    }
+  }
+
+  if (request.method === "DELETE" && path === "/settings/ai") {
+    try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
+    try {
+      const config = await getConfig(user.id);
+      await saveConfig(user.id, { ...config, aiKey: "", aiVerified: false, aiMessage: "No AI provider key is saved." });
+      return json({ disconnected: true, ai: { configured: false, connected: false, status: "not_configured", message: "No AI provider key is saved." } });
+    } catch (error) {
+      return json({ detail: error.message || "Could not disconnect the AI provider key." }, 500);
     }
   }
 
@@ -186,7 +224,7 @@ export default async function handler(request) {
     const record = await readJson(analysisKey(user.id, runId));
     if (!record) return json({ detail: "This saved workflow run was not found." }, 404);
     const config = await getConfig(user.id);
-    if (!config.githubToken || !config.aiKey) return json({ detail: "Connect both GitHub Actions access and an AI provider before retrying." }, 400);
+    if (!config.githubToken || !config.aiKey) return json({ detail: "Connect GitHub Actions and an AI provider before retrying." }, 400);
     if (config.repository.toLowerCase() !== String(record.repository || "").toLowerCase()) {
       return json({ detail: `This run belongs to ${record.repository}. Reconnect that repository before retrying.` }, 400);
     }

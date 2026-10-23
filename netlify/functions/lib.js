@@ -1,6 +1,8 @@
 import { getStore } from "@netlify/blobs";
 import { getUser } from "@netlify/identity";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 
 export const store = getStore("pipeline-pulse-data");
 
@@ -69,17 +71,107 @@ export function isRepoName(value) {
   return /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(value || "");
 }
 
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
+
+function inferAIProvider(baseUrl = "") {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (host === "generativelanguage.googleapis.com") return "gemini";
+    if (host === "api.openai.com") return "openai";
+    if (host === "api.anthropic.com") return "anthropic";
+  } catch {}
+  return "openai_compatible";
+}
+
+function defaultAIBaseUrl(provider) {
+  return { gemini: GEMINI_BASE_URL, openai: OPENAI_BASE_URL, anthropic: ANTHROPIC_BASE_URL }[provider] || "";
+}
+
+function isPublicAddress(address) {
+  if (isIP(address) === 4) {
+    const [a, b, c] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || (b === 0 && c === 0) || (b === 0 && c === 2) || (b === 88 && c === 99) || (b === 168 && c === 0) || (b === 168 && c === 2)))
+      || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) || (a === 203 && b === 0 && c === 113));
+  }
+  if (isIP(address) === 6) {
+    const value = address.toLowerCase();
+    return !(value === "::" || value === "::1" || value.startsWith("::ffff:") || value.startsWith("fc") || value.startsWith("fd")
+      || /^fe[89ab]/.test(value) || value.startsWith("ff") || value.startsWith("2001:db8:"));
+  }
+  return false;
+}
+
+async function validateAIBaseUrl(baseUrl, provider) {
+  const direct = defaultAIBaseUrl(provider);
+  const endpoint = String(baseUrl || direct).trim().replace(/\/$/, "");
+  if (!endpoint || endpoint.length > 500) throw new Error("The AI API URL is invalid.");
+  if (provider !== "openai_compatible" && endpoint !== direct) throw new Error("This provider uses its official API endpoint.");
+  const parsed = new URL(endpoint);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("Enter a valid HTTPS AI API URL.");
+  if (provider === "openai_compatible") {
+    const host = parsed.hostname.toLowerCase();
+    if (!host.includes(".") || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".lan")) {
+      throw new Error("Custom provider URLs must use a public HTTPS host.");
+    }
+    let addresses;
+    if (isIP(host)) addresses = [{ address: host }];
+    else addresses = await lookup(host, { all: true, verbatim: true });
+    if (!addresses.length || addresses.some(item => !isPublicAddress(item.address))) throw new Error("Custom provider URLs must resolve to a public server address.");
+  }
+  return endpoint;
+}
+
+export function buildAIRequest(apiKey, provider, baseUrl, model, messages, maxTokens) {
+  if (provider === "anthropic") {
+    const system = messages.filter(item => item.role === "system").map(item => item.content).join("\n\n");
+    const body = { model, max_tokens: maxTokens, messages: messages.filter(item => item.role !== "system") };
+    if (system) body.system = system;
+    return { url: `${baseUrl}/messages`, headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" }, body };
+  }
+  return { url: `${baseUrl}/chat/completions`, headers: { authorization: `Bearer ${apiKey}` },
+    body: { model, max_tokens: maxTokens, messages } };
+}
+
+export function aiResponseText(payload, provider) {
+  if (provider === "anthropic") return (payload?.content || []).filter(item => item?.type === "text").map(item => item.text || "").join("").trim();
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) return content.filter(item => typeof item?.text === "string").map(item => item.text).join("").trim();
+  return "";
+}
+
+export function aiConnectionStatus(connected, message = "") {
+  if (connected) return "connected";
+  const lower = String(message).toLowerCase();
+  if (/no available quota|quota or credits|insufficient.*quota|quota.*exhausted/.test(lower)) return "quota_exhausted";
+  if (/rate-limit|rate limit|too many requests/.test(lower)) return "rate_limited";
+  if (/temporarily unavailable|timed out|did not respond|could not reach/.test(lower)) return "provider_unavailable";
+  return "disconnected";
+}
+
+export function shouldKeepAISettings(result) {
+  return result?.connected === true || ["rate_limited", "quota_exhausted", "provider_unavailable"].includes(aiConnectionStatus(false, result?.message));
+}
+
 export async function getConfig(userId) {
   const stored = await readJson(userConfigKey(userId));
-  if (!stored) return { githubToken: "", aiKey: "", repository: "", aiBaseUrl: process.env.LLM_BASE_URL || "https://api.openai.com/v1", aiModel: process.env.LLM_MODEL || "gpt-4o-mini", aiVerified: false, aiMessage: "No AI provider key is saved." };
+  const defaultProvider = process.env.AI_PROVIDER || (process.env.LLM_BASE_URL ? inferAIProvider(process.env.LLM_BASE_URL) : "gemini");
+  if (!stored) return { githubToken: "", aiKey: "", repository: "", aiProvider: defaultProvider,
+    aiBaseUrl: process.env.LLM_BASE_URL || defaultAIBaseUrl(defaultProvider),
+    aiModel: process.env.LLM_MODEL || (defaultProvider === "gemini" ? DEFAULT_GEMINI_MODEL : ""), aiVerified: false, aiMessage: "No AI provider key is saved." };
   return {
     githubToken: decrypt(stored.githubToken || ""),
     aiKey: decrypt(stored.aiKey || ""),
     repository: stored.repository || "",
-    aiBaseUrl: stored.aiBaseUrl || process.env.LLM_BASE_URL || "https://api.openai.com/v1",
-    aiModel: stored.aiModel || process.env.LLM_MODEL || "gpt-4o-mini",
+    aiProvider: stored.aiProvider || inferAIProvider(stored.aiBaseUrl || process.env.LLM_BASE_URL || ""),
+    aiBaseUrl: stored.aiBaseUrl || process.env.LLM_BASE_URL || defaultAIBaseUrl(stored.aiProvider || "gemini"),
+    aiModel: stored.aiModel || process.env.LLM_MODEL || ((stored.aiProvider || inferAIProvider(stored.aiBaseUrl || "")) === "gemini" ? DEFAULT_GEMINI_MODEL : ""),
     aiVerified: stored.aiVerified === true,
-    aiMessage: stored.aiMessage || "AI key is saved but has not been verified. Click Connect both to test it.",
+    aiMessage: stored.aiMessage || "AI key is saved but has not been verified. Click Check AI to test it.",
   };
 }
 
@@ -88,8 +180,9 @@ export async function saveConfig(userId, config) {
     githubToken: config.githubToken ? encrypt(config.githubToken) : "",
     aiKey: config.aiKey ? encrypt(config.aiKey) : "",
     repository: config.repository || "",
-    aiBaseUrl: config.aiBaseUrl || process.env.LLM_BASE_URL || "https://api.openai.com/v1",
-    aiModel: config.aiModel || process.env.LLM_MODEL || "gpt-4o-mini",
+    aiProvider: config.aiProvider || "gemini",
+    aiBaseUrl: config.aiBaseUrl || defaultAIBaseUrl(config.aiProvider || "gemini"),
+    aiModel: config.aiModel || (config.aiProvider === "gemini" ? DEFAULT_GEMINI_MODEL : ""),
     aiVerified: config.aiVerified === true,
     aiMessage: config.aiMessage || "",
     updatedAt: new Date().toISOString(),
@@ -134,23 +227,22 @@ export function redact(text) {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]");
 }
 
-export async function verifyAIKey(apiKey, baseUrl = process.env.LLM_BASE_URL || "https://api.openai.com/v1", model = process.env.LLM_MODEL || "gpt-4o-mini") {
+export async function verifyAIKey(apiKey, provider = "gemini", baseUrl = "", model = DEFAULT_GEMINI_MODEL) {
   if (!apiKey) return { connected: false, message: "No AI provider API key is saved." };
   let endpoint;
   try {
-    const parsed = new URL(baseUrl);
-    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("Invalid URL");
-    endpoint = parsed.toString().replace(/\/$/, "");
+    if (!["gemini", "openai", "anthropic", "openai_compatible"].includes(provider)) throw new Error("Choose a supported AI provider.");
+    endpoint = await validateAIBaseUrl(baseUrl, provider);
   } catch {
-    return { connected: false, message: "Enter a valid HTTPS AI API URL." };
+    return { connected: false, message: provider === "openai_compatible" ? "Enter a public HTTPS URL for an OpenAI-compatible chat-completions API." : "The selected AI provider settings are invalid." };
   }
   if (!model || model.length > 160 || /[\r\n]/.test(model)) return { connected: false, message: "Enter a valid model name." };
   try {
-    // This one-token probe confirms that the account can actually generate a response.
-    const response = await fetch(`${endpoint}/chat/completions`, {
-      method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({ model, temperature: 0, max_tokens: 2, messages: [{ role: "user", content: "Reply OK." }] }),
-      signal: AbortSignal.timeout(20000),
+    // A tiny generation probe checks usable quota, not only key formatting.
+    const request = buildAIRequest(apiKey, provider, endpoint, model, [{ role: "user", content: "Reply exactly OK." }], provider === "anthropic" ? 24 : 128);
+    const response = await fetch(request.url, {
+      method: "POST", redirect: "error", headers: { ...request.headers, "content-type": "application/json" },
+      body: JSON.stringify(request.body), signal: AbortSignal.timeout(20000),
     });
     if (!response.ok) {
       let detail = "";
@@ -166,8 +258,8 @@ export async function verifyAIKey(apiKey, baseUrl = process.env.LLM_BASE_URL || 
       return { connected: false, message };
     }
     const payload = await response.json();
-    if (!payload?.choices?.length) return { connected: false, message: "The AI provider did not return a model response. Check the model name." };
-    return { connected: true, message: `Connected to ${new URL(endpoint).hostname} (${model}); test response succeeded.` };
+    if (!aiResponseText(payload, provider)) return { connected: false, message: "The AI provider did not return a model response. Check the model name." };
+    return { connected: true, message: `Connected to ${provider === "openai_compatible" ? new URL(endpoint).hostname : provider} (${model}); test response succeeded.` };
   } catch {
     return { connected: false, message: "Could not reach the AI provider. Check your internet connection and API URL." };
   }

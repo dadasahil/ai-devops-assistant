@@ -35,7 +35,7 @@ LOCAL_SETTINGS = ROOT / ".env.local"
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
-GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
 def read_local_llm_key() -> str:
@@ -120,8 +120,9 @@ _environment_ai_key = (os.getenv("AI_API_KEY") or os.getenv("LLM_API_KEY") or os
 LLM_API_KEY = "" if LOCAL_AI_DISABLED else (_local_ai_key or _environment_ai_key)
 _local_ai_provider = read_local_setting("AI_PROVIDER").strip().lower()
 _saved_ai_base_url = read_local_setting("AI_BASE_URL").rstrip("/")
-AI_PROVIDER = _local_ai_provider or AI_PROVIDER or infer_ai_provider(_saved_ai_base_url or LLM_BASE_URL,
+AI_PROVIDER = _local_ai_provider or AI_PROVIDER or (infer_ai_provider(_saved_ai_base_url or LLM_BASE_URL,
     "GEMINI_API_KEY" if read_local_setting("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") else "")
+    if _saved_ai_base_url or LLM_BASE_URL or LLM_API_KEY else "gemini")
 LLM_BASE_URL = _saved_ai_base_url or LLM_BASE_URL or default_ai_base_url(AI_PROVIDER)
 LLM_MODEL = read_local_setting("AI_MODEL").strip() or LLM_MODEL or (GEMINI_DEFAULT_MODEL if AI_PROVIDER == "gemini" else "")
 if not GITHUB_TOKEN:
@@ -194,20 +195,52 @@ def require_local_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="This request did not come from the local dashboard. Reload and try again.")
 
 
-def validate_ai_settings(base_url: str, model: str, *, hosted: bool = False) -> tuple[str, str] | None:
-    """Validate an OpenAI-compatible API base URL and model before making a request."""
-    base_url = (base_url or "").strip().rstrip("/")
+AI_PROVIDER_LABELS = {"gemini": "Google Gemini", "openai": "OpenAI", "anthropic": "Anthropic Claude",
+                     "openai_compatible": "OpenAI-compatible provider"}
+
+
+def ai_provider_label(provider: str) -> str:
+    return AI_PROVIDER_LABELS.get(provider, "AI provider")
+
+
+@lru_cache(maxsize=128)
+def public_ai_host(host: str, port: int) -> bool:
+    """Reject private/internal destinations for user-supplied provider URLs."""
+    if host.lower().endswith((".localhost", ".local", ".internal", ".lan")) or host.lower() in {"localhost", "metadata.google.internal"}:
+        return False
+    try:
+        addresses = [ipaddress.ip_address(host)] if host else []
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+        except (OSError, ValueError):
+            return False
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+def validate_ai_settings(base_url: str | None, model: str, *, provider: str | None = None, hosted: bool = False) -> tuple[str, str] | None:
+    """Validate the selected provider, model, and endpoint before making a request."""
+    provider = (provider or AI_PROVIDER or "gemini").strip().lower()
+    if provider not in AI_PROVIDER_LABELS:
+        return None
     model = (model or "").strip()
-    if any(ord(char) < 32 for char in base_url):
+    if not model or len(model) > 160 or any(ord(char) < 32 for char in model):
+        return None
+    direct_url = default_ai_base_url(provider)
+    base_url = (base_url or direct_url).strip().rstrip("/")
+    if provider != "openai_compatible" and base_url != direct_url:
+        return None
+    if not base_url or len(base_url) > 500 or any(ord(char) < 32 for char in base_url):
         return None
     try:
         parsed = urlsplit(base_url)
-        valid_scheme = parsed.scheme == "https" or (parsed.scheme == "http" and not hosted and parsed.hostname in {"localhost", "127.0.0.1", "::1"})
-        if not valid_scheme or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        host = parsed.hostname
+        valid_scheme = parsed.scheme == "https" or (parsed.scheme == "http" and not hosted and host in {"localhost", "127.0.0.1", "::1"})
+        if not valid_scheme or not host or parsed.username or parsed.password or parsed.query or parsed.fragment:
             return None
-    except ValueError:
-        return None
-    if not model or len(model) > 160 or any(ord(char) < 32 for char in model):
+        if provider == "openai_compatible" and parsed.scheme == "https" and not public_ai_host(host, parsed.port or 443):
+            return None
+    except (ValueError, OSError):
         return None
     return base_url, model
 
@@ -250,35 +283,62 @@ def ai_error_message(response: httpx.Response) -> str:
     return f"The AI provider could not complete a request (HTTP {status})."
 
 
-def check_ai_key(api_key: str, base_url: str | None = None, model: str | None = None, *, hosted: bool = False) -> tuple[bool, str]:
+def ai_request_details(api_key: str, provider: str, base_url: str, model: str, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, dict[str, str], dict[str, Any]]:
+    if provider == "anthropic":
+        system = "\n\n".join(message["content"] for message in messages if message["role"] == "system")
+        user_messages = [{"role": message["role"], "content": message["content"]} for message in messages if message["role"] != "system"]
+        body: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": user_messages}
+        if system:
+            body["system"] = system
+        return f"{base_url}/messages", {"x-api-key": api_key, "anthropic-version": "2023-06-01"}, body
+    return f"{base_url}/chat/completions", {"Authorization": f"Bearer {api_key}"}, {
+        "model": model, "max_tokens": max_tokens, "messages": messages,
+    }
+
+
+def ai_response_text(data: dict[str, Any], provider: str) -> str:
+    if provider == "anthropic":
+        return "".join(item.get("text", "") for item in data.get("content", []) if isinstance(item, dict) and item.get("type") == "text").strip()
+    choices = data.get("choices") or []
+    content = choices[0].get("message", {}).get("content") if choices else ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
+    return ""
+
+
+def request_ai(api_key: str, provider: str, base_url: str, model: str, messages: list[dict[str, str]], max_tokens: int, timeout: int) -> httpx.Response:
+    endpoint, auth_headers, payload = ai_request_details(api_key, provider, base_url, model, messages, max_tokens)
+    return httpx.post(endpoint, headers={**auth_headers, "Content-Type": "application/json"}, json=payload, timeout=timeout)
+
+
+def check_ai_key(api_key: str, base_url: str | None = None, model: str | None = None, *, provider: str | None = None, hosted: bool = False) -> tuple[bool, str]:
     if not api_key:
         return False, "No AI provider API key is saved."
-    config = validate_ai_settings(base_url or LLM_BASE_URL, model or LLM_MODEL, hosted=hosted)
+    provider = (provider or AI_PROVIDER or "gemini").strip().lower()
+    config = validate_ai_settings(base_url if base_url is not None else LLM_BASE_URL, model if model is not None else LLM_MODEL,
+                                  provider=provider, hosted=hosted)
     if not config:
-        return False, "Enter a valid HTTPS AI API URL and model name. Local HTTP URLs are allowed only in the local app."
+        return False, "Choose a supported provider and enter a valid model. Custom providers need a public HTTPS OpenAI-compatible API URL."
     endpoint, selected_model = config
     try:
         # A tiny real completion checks that this key can actually run a diagnosis;
         # listing models alone can succeed even when the account has no usable quota.
-        response = httpx.post(f"{endpoint}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            # Gemini may spend a small output budget on internal reasoning and
-            # return no visible text if this is only a couple of tokens.
-            json={"model": selected_model, "max_tokens": 128, "reasoning_effort": "low",
-                  "messages": [{"role": "user", "content": "Reply OK."}]}, timeout=15)
+        response = request_ai(api_key, provider, endpoint, selected_model,
+                              [{"role": "user", "content": "Reply exactly OK."}], 24 if provider == "anthropic" else 128, 15)
     except httpx.TimeoutException:
-        return False, "Gemini did not respond within 15 seconds. The API key is still saved; try the check again later."
+        return False, "The AI provider did not respond within 15 seconds. Try the connection check again later."
     except httpx.HTTPError as exc:
         return False, f"Could not reach the AI provider ({type(exc).__name__}). Check your internet connection and AI API URL."
     if not response.is_success:
         return False, ai_error_message(response)
     try:
-        choices = response.json().get("choices")
-        if not choices or not isinstance(choices[0].get("message", {}).get("content"), str) or not choices[0]["message"]["content"].strip():
+        if not ai_response_text(response.json(), provider):
             return False, "The AI provider responded, but did not return a model response. Check the model name."
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return False, "The AI provider returned an unreadable response. Check the API URL and model."
-    return True, f"Connected to {provider_name(endpoint)} ({selected_model}); test response succeeded."
+    return True, f"Connected to {ai_provider_label(provider)} ({selected_model}); test response succeeded."
 
 
 def ai_check_state(ok: bool, message: str) -> str:
@@ -296,17 +356,19 @@ def ai_check_state(ok: bool, message: str) -> str:
 
 def record_ai_check(ok: bool, message: str) -> None:
     """Persist provider status without confusing a quota pause with a missing key."""
-    global AI_LAST_CHECK_BASE_URL, AI_LAST_CHECK_MODEL, AI_LAST_CHECK_STATUS
+    global AI_LAST_CHECK_BASE_URL, AI_LAST_CHECK_MODEL, AI_LAST_CHECK_PROVIDER, AI_LAST_CHECK_STATUS
     global AI_LAST_CHECK_MESSAGE, AI_LAST_CHECK_KEY_HASH, AI_LAST_CHECK_AT
     AI_LAST_CHECK_BASE_URL = LLM_BASE_URL
     AI_LAST_CHECK_MODEL = LLM_MODEL
+    AI_LAST_CHECK_PROVIDER = AI_PROVIDER
     AI_LAST_CHECK_STATUS = ai_check_state(ok, message)
     AI_LAST_CHECK_MESSAGE = message
-    AI_LAST_CHECK_KEY_HASH = hashlib.sha256(SHARED_AI_KEY.encode()).hexdigest()[:20] if SHARED_AI_KEY else ""
+    AI_LAST_CHECK_KEY_HASH = hashlib.sha256(LLM_API_KEY.encode()).hexdigest()[:20] if LLM_API_KEY else ""
     AI_LAST_CHECK_AT = str(int(time.time()))
     write_local_settings({
         "AI_LAST_CHECK_BASE_URL": AI_LAST_CHECK_BASE_URL,
         "AI_LAST_CHECK_MODEL": AI_LAST_CHECK_MODEL,
+        "AI_LAST_CHECK_PROVIDER": AI_LAST_CHECK_PROVIDER,
         "AI_LAST_CHECK_STATUS": AI_LAST_CHECK_STATUS,
         "AI_LAST_CHECK_MESSAGE": AI_LAST_CHECK_MESSAGE,
         "AI_LAST_CHECK_KEY_HASH": AI_LAST_CHECK_KEY_HASH,
@@ -315,23 +377,21 @@ def record_ai_check(ok: bool, message: str) -> None:
 
 
 def saved_ai_status() -> dict[str, Any]:
-    if not SHARED_AI_KEY:
-        return {"configured": False, "connected": False, "available": False, "status": "not_configured", "message": "Built-in Gemini is not configured on this computer. The app owner must add GEMINI_API_KEY to the private local settings."}
     if not LLM_API_KEY:
-        if AI_LAST_CHECK_STATUS == "disconnected" and AI_LAST_CHECK_MESSAGE:
-            state = ai_check_state(False, AI_LAST_CHECK_MESSAGE)
-            return {"configured": True, "connected": False, "available": False, "status": state, "message": AI_LAST_CHECK_MESSAGE}
-        return {"configured": True, "connected": False, "available": False, "status": "unverified", "message": "Built-in Gemini is ready to verify when you connect GitHub."}
-    current_key_hash = hashlib.sha256(SHARED_AI_KEY.encode()).hexdigest()[:20]
+        return {"configured": False, "connected": False, "available": False, "status": "not_configured",
+                "provider": AI_PROVIDER, "model": LLM_MODEL, "message": "Enter an AI provider key and model, then connect it."}
+    current_key_hash = hashlib.sha256(LLM_API_KEY.encode()).hexdigest()[:20]
     if (AI_LAST_CHECK_BASE_URL != LLM_BASE_URL or AI_LAST_CHECK_MODEL != LLM_MODEL
+            or AI_LAST_CHECK_PROVIDER != AI_PROVIDER
             or AI_LAST_CHECK_KEY_HASH != current_key_hash or not AI_LAST_CHECK_STATUS):
-        return {"configured": True, "connected": False, "available": False, "status": "unverified", "message": "Built-in Gemini is configured but has not been checked yet."}
+        return {"configured": True, "connected": False, "available": False, "status": "unverified",
+                "provider": AI_PROVIDER, "model": LLM_MODEL, "message": f"{ai_provider_label(AI_PROVIDER)} is configured but has not been checked yet."}
     state = AI_LAST_CHECK_STATUS
     if state == "disconnected":
         # Upgrade old saved 429 statuses so existing users see the real state after restart.
         state = ai_check_state(False, AI_LAST_CHECK_MESSAGE)
     available = state == "connected"
-    return {"configured": True, "connected": available, "available": available,
+    return {"configured": True, "connected": available, "available": available, "provider": AI_PROVIDER, "model": LLM_MODEL,
             "status": state, "message": AI_LAST_CHECK_MESSAGE or "Check the AI provider status."}
 
 
@@ -560,7 +620,7 @@ def analyze(run_id: int) -> None:
             if not log_excerpt:
                 log_excerpt = "GitHub returned an empty log archive."
         diagnosis = diagnose(record, job_summaries, log_excerpt)
-        record_ai_check(True, f"Connected to {provider_name(LLM_BASE_URL)} ({LLM_MODEL}); diagnosis succeeded.")
+        record_ai_check(True, f"Connected to {ai_provider_label(AI_PROVIDER)} ({LLM_MODEL}); diagnosis succeeded.")
         with db() as conn:
             conn.execute("""UPDATE analyses SET status='complete', summary=?, likely_causes=?, evidence=?,
                 suggested_fix=?, verification_steps=?, uncertainty=?, error=NULL WHERE run_id=?""",
@@ -600,12 +660,13 @@ def diagnose(record: dict[str, Any], jobs: list[dict[str, Any]], logs: str) -> d
                   "If evidence is insufficient, say so plainly in cause and describe the single most useful next check in fix. "
                   "Do not invent files, commands, versions, configuration, or facts. Do not repeat irrelevant log lines, add generic filler, or claim a fix was applied or tested.")
         user = json.dumps({"repository": record["repository"], "workflow": record["workflow"], "branch": record["branch"], "failed_jobs": jobs, "redacted_logs": logs})
-        response = httpx.post(f"{LLM_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            json={"model": LLM_MODEL, "max_tokens": 700, "reasoning_effort": "low",
-                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout=60)
+        response = request_ai(LLM_API_KEY, AI_PROVIDER, LLM_BASE_URL, LLM_MODEL,
+                              [{"role": "system", "content": system}, {"role": "user", "content": user}], 700, 60)
         if not response.is_success:
             raise AIProviderError(ai_error_message(response))
-        content = response.json()["choices"][0]["message"]["content"]
+        content = ai_response_text(response.json(), AI_PROVIDER)
+        if not content:
+            raise ValueError("The AI provider returned an empty diagnosis")
         content = content.strip()
         if content.startswith("```"):
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE).strip()
@@ -750,7 +811,7 @@ def retry_analysis(run_id: int, request: Request, background: BackgroundTasks) -
     if not record:
         raise HTTPException(status_code=404, detail="This saved workflow run was not found.")
     if not GITHUB_TOKEN or not LLM_API_KEY:
-        raise HTTPException(status_code=400, detail="Connect both GitHub Actions access and an AI provider before retrying.")
+        raise HTTPException(status_code=400, detail="Connect GitHub Actions and an AI provider before retrying.")
     if record["repository"].lower() != MONITORED_REPOSITORY.lower():
         raise HTTPException(status_code=400, detail=f"This run belongs to {record['repository']}. Reconnect that repository before retrying.")
     if record["status"] in {"queued", "running"}:
@@ -763,10 +824,10 @@ def retry_analysis(run_id: int, request: Request, background: BackgroundTasks) -
 
 @app.post("/api/settings/ai/check")
 def recheck_ai_connection(request: Request) -> dict[str, Any]:
-    """Recheck Gemini only on explicit user action, with a shared one-minute cooldown."""
+    """Recheck the selected AI provider only on explicit user action."""
     require_local_request(request)
     require_local_origin(request)
-    if not SHARED_AI_KEY:
+    if not LLM_API_KEY:
         return saved_ai_status()
     try:
         last_check = float(AI_LAST_CHECK_AT or "0")
@@ -777,7 +838,7 @@ def recheck_ai_connection(request: Request) -> dict[str, Any]:
         result = saved_ai_status()
         result["retry_after_seconds"] = max(1, int(remaining) + 1)
         return result
-    ai_ok, ai_message = check_ai_key(SHARED_AI_KEY, LLM_BASE_URL, LLM_MODEL)
+    ai_ok, ai_message = check_ai_key(LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, provider=AI_PROVIDER)
     record_ai_check(ai_ok, ai_message)
     return saved_ai_status()
 
@@ -807,7 +868,8 @@ def connection_status(request: Request) -> dict[str, Any]:
         github_ok, github_message = False, "No GitHub token is saved."
     return {
         "ai": ai,
-        "ai_key_shared": bool(SHARED_AI_KEY),
+        "ai_key_saved": bool(LLM_API_KEY),
+        "ai_provider": AI_PROVIDER,
         "ai_base_url": LLM_BASE_URL,
         "ai_model": LLM_MODEL,
         "github": {"connected": github_ok, "message": github_message},
@@ -818,8 +880,8 @@ def connection_status(request: Request) -> dict[str, Any]:
 
 @app.post("/api/settings/connections")
 async def save_and_verify_connections(request: Request) -> dict[str, Any]:
-    """Connect one GitHub token and verify the app owner's built-in Gemini key."""
-    global GITHUB_TOKEN, MONITORED_REPOSITORY
+    """Save a user's AI provider key and/or GitHub token after verifying each."""
+    global GITHUB_TOKEN, MONITORED_REPOSITORY, LLM_API_KEY, AI_PROVIDER, LLM_BASE_URL, LLM_MODEL, LOCAL_AI_DISABLED
     require_local_request(request)
     require_local_origin(request)
     try:
@@ -827,13 +889,35 @@ async def save_and_verify_connections(request: Request) -> dict[str, Any]:
         github_token = str(body.get("github_token", "")).strip() or GITHUB_TOKEN
         repository = str(body.get("repository", "")).strip()
     except (ValueError, AttributeError):
-        raise HTTPException(status_code=400, detail="Enter the GitHub token and repository in their fields.")
+        raise HTTPException(status_code=400, detail="Enter valid connection settings.")
 
-    if SHARED_AI_KEY:
-        ai_ok, ai_message = check_ai_key(SHARED_AI_KEY, LLM_BASE_URL, LLM_MODEL)
-        record_ai_check(ai_ok, ai_message)
-    else:
-        ai_ok, ai_message = False, saved_ai_status()["message"]
+    ai_attempt = None
+    ai_fields_sent = any(name in body for name in ("ai_key", "ai_provider", "ai_model", "ai_base_url"))
+    if ai_fields_sent:
+        candidate_key = str(body.get("ai_key", "")).strip() or LLM_API_KEY
+        candidate_provider = str(body.get("ai_provider", AI_PROVIDER)).strip().lower()
+        candidate_model = str(body.get("ai_model", LLM_MODEL)).strip()
+        candidate_base_url = str(body.get("ai_base_url", LLM_BASE_URL)).strip().rstrip("/")
+        if candidate_provider != "openai_compatible":
+            candidate_base_url = default_ai_base_url(candidate_provider)
+        if len(candidate_key) > 500 or "\n" in candidate_key or "\r" in candidate_key:
+            ai_attempt = {"connected": False, "message": "The AI provider key format is invalid."}
+        else:
+            ai_ok, ai_message = check_ai_key(candidate_key, candidate_base_url, candidate_model,
+                                               provider=candidate_provider)
+            ai_attempt = {"connected": ai_ok, "message": ai_message, "configured": bool(candidate_key),
+                          "provider": candidate_provider, "model": candidate_model}
+            keep_candidate = ai_ok or ai_check_state(False, ai_message) in {"rate_limited", "quota_exhausted", "provider_unavailable"}
+            ai_attempt["saved"] = keep_candidate
+            if keep_candidate:
+                AI_PROVIDER = candidate_provider
+                LLM_API_KEY = candidate_key
+                LLM_BASE_URL = candidate_base_url
+                LLM_MODEL = candidate_model
+                LOCAL_AI_DISABLED = False
+                write_local_settings({"AI_API_KEY": LLM_API_KEY, "AI_PROVIDER": AI_PROVIDER,
+                                      "AI_BASE_URL": LLM_BASE_URL, "AI_MODEL": LLM_MODEL, "AI_DISABLED": "0"})
+                record_ai_check(ai_ok, ai_message)
 
     repositories: list[str] = []
     if len(github_token) > 500 or "\n" in github_token or "\r" in github_token:
@@ -866,9 +950,14 @@ async def save_and_verify_connections(request: Request) -> dict[str, Any]:
             repositories = [repository]
     if updates:
         write_local_settings(updates)
+    ai_state = saved_ai_status()
     return {
-        "ai": saved_ai_status(),
-        "ai_key_shared": bool(SHARED_AI_KEY),
+        "ai": ai_state,
+        "ai_attempt": ai_attempt,
+        "ai_key_saved": bool(LLM_API_KEY),
+        "ai_provider": AI_PROVIDER,
+        "ai_base_url": LLM_BASE_URL,
+        "ai_model": LLM_MODEL,
         "github": {"connected": github_ok, "message": github_message},
         "repository": repository,
         "repositories": repositories,
@@ -878,7 +967,7 @@ async def save_and_verify_connections(request: Request) -> dict[str, Any]:
 @app.delete("/api/settings/connections")
 @app.delete("/api/settings/github")
 def disconnect_github(request: Request) -> dict[str, Any]:
-    """Forget only the saved GitHub token and repository; keep built-in Gemini configured."""
+    """Forget only the saved GitHub token and repository; keep the AI provider configured."""
     global GITHUB_TOKEN, MONITORED_REPOSITORY
     require_local_request(request)
     require_local_origin(request)
@@ -892,23 +981,45 @@ def disconnect_github(request: Request) -> dict[str, Any]:
     return {"disconnected": True, "ai": saved_ai_status()}
 
 
+@app.delete("/api/settings/ai")
+def disconnect_ai(request: Request) -> dict[str, Any]:
+    """Disable saved AI credentials while keeping GitHub access and run history."""
+    global LLM_API_KEY, AI_PROVIDER, LLM_BASE_URL, LLM_MODEL, LOCAL_AI_DISABLED
+    global AI_LAST_CHECK_BASE_URL, AI_LAST_CHECK_MODEL, AI_LAST_CHECK_PROVIDER, AI_LAST_CHECK_STATUS
+    global AI_LAST_CHECK_MESSAGE, AI_LAST_CHECK_KEY_HASH, AI_LAST_CHECK_AT
+    require_local_request(request)
+    require_local_origin(request)
+    LOCAL_AI_DISABLED = True
+    LLM_API_KEY = ""
+    AI_PROVIDER = "gemini"
+    LLM_BASE_URL = GEMINI_OPENAI_BASE_URL
+    LLM_MODEL = GEMINI_DEFAULT_MODEL
+    AI_LAST_CHECK_BASE_URL = AI_LAST_CHECK_MODEL = AI_LAST_CHECK_PROVIDER = ""
+    AI_LAST_CHECK_STATUS = AI_LAST_CHECK_MESSAGE = AI_LAST_CHECK_KEY_HASH = AI_LAST_CHECK_AT = ""
+    remove_local_settings({"AI_API_KEY", "AI_PROVIDER", "AI_BASE_URL", "AI_MODEL", "AI_LAST_CHECK_BASE_URL",
+                          "AI_LAST_CHECK_MODEL", "AI_LAST_CHECK_PROVIDER", "AI_LAST_CHECK_STATUS",
+                          "AI_LAST_CHECK_MESSAGE", "AI_LAST_CHECK_KEY_HASH", "AI_LAST_CHECK_AT"})
+    write_local_settings({"AI_DISABLED": "1"})
+    return {"disconnected": True, "ai": saved_ai_status()}
+
+
 @app.get("/api/settings/llm")
 def llm_status(request: Request) -> dict[str, Any]:
     host = request.headers.get("host", "").split(":", 1)[0].lower()
     if host not in {"localhost", "127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="Settings are local-only.")
-    return {"configured": bool(LLM_API_KEY), "shared": bool(SHARED_AI_KEY), "provider": provider_name(LLM_BASE_URL) if LLM_API_KEY else None,
+    return {"configured": bool(LLM_API_KEY), "provider": AI_PROVIDER if LLM_API_KEY else None,
             "model": LLM_MODEL if LLM_API_KEY else None}
 
 
 @app.post("/api/settings/llm")
 async def save_llm_key(request: Request) -> dict[str, Any]:
-    """Prevent AI keys from being submitted by dashboard users."""
+    """Keep the legacy endpoint closed; the dashboard uses the checked connections endpoint."""
     host = request.headers.get("host", "").split(":", 1)[0].lower()
     if host not in {"localhost", "127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="Settings are local-only.")
     require_local_origin(request)
-    raise HTTPException(status_code=410, detail="AI is built into this app and configured privately by its owner. Only a GitHub token is needed here.")
+    raise HTTPException(status_code=410, detail="Use the AI provider connection form on the dashboard to save and verify your key.")
 
 
 @app.get("/api/settings/github")
