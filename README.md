@@ -34,7 +34,7 @@ An API key only works with the provider and models that issued or accept it. A C
 
 Then paste a fine-grained GitHub token with access to the repository and **Actions: Read-only** permission, choose a repository detected from that token, and click **Connect GitHub**. Click **Refresh** to check recent workflow failures and start diagnosis. Open a failure card to read its summary, cause, and suggested fix.
 
-For local use, the selected AI key and GitHub token are stored in the ignored `.env.local` file on this computer; this local dashboard has no sign-in, so keep the server bound to localhost. The hosted Netlify version stores each signed-in user's keys encrypted in that user's private connection record. Analysis history is stored in the ignored `devops_assistant.db` SQLite file locally. Redacted failure-log excerpts are sent to the selected AI provider for diagnosis; redaction is best-effort. **Disconnect AI** removes the selected key while keeping GitHub access and saved history.
+For local use, the selected AI key and GitHub token are stored in the ignored `.env.local` file on this computer; this local dashboard has no sign-in, so keep the server bound to localhost. The hosted Netlify dashboard also has no account or sign-in page. It creates a private browser session using a random, HttpOnly cookie, then encrypts that browser's GitHub and AI keys in Netlify Blobs. Saved workflow history belongs to that browser session. Clearing this site's browser data or switching browsers/devices loses access to that session's saved settings and history. Analysis history is stored in the ignored `devops_assistant.db` SQLite file locally. Redacted failure-log excerpts are sent to the selected AI provider for diagnosis; redaction is best-effort. **Disconnect AI** removes the selected key while keeping GitHub access and saved history.
 
 If the provider reports no quota or credits, the GitHub failure can still be captured and shown, but a full AI diagnosis cannot run. Check quota with that provider, then click **Check AI** or **Retry diagnosis** on the saved failure.
 
@@ -44,14 +44,14 @@ Refresh works by polling GitHub, so a webhook is optional. To receive failures w
 
 ## Netlify hosting
 
-The hosted version uses Netlify Functions, encrypted per-user GitHub and AI credentials, and invite-only Netlify Identity to protect private workflow history and repository access. Each signed-in user connects their own AI key in the dashboard. It requires Netlify Blobs, Identity, and these site environment variables:
+The hosted version uses Netlify Functions and Netlify Blobs. It has no login or account system: each browser gets a random private session cookie, and its GitHub and AI credentials are encrypted before storage. Users enter their own provider keys. Each browser/device has a separate session; clearing browser data removes its session cookie and makes its saved settings and history inaccessible. Netlify Blobs and these site environment variables are required:
 
 - `CREDENTIAL_ENCRYPTION_KEY`: 32 random bytes encoded as Base64.
 - `BACKGROUND_JOB_SECRET`: a separate long random secret for internal analysis jobs.
 - `GITHUB_WEBHOOK_SECRET`: a separate secret for the optional GitHub webhook.
 - Optional default provider settings: `AI_PROVIDER`, `LLM_BASE_URL`, and `LLM_MODEL`.
 
-For manual deployment, build with `npm run build`, publish `static`, and deploy the Netlify Functions in `netlify/functions`. Configure the required site services and secrets before expecting hosted analysis to work. The public hosted site must remain access-controlled; removing access control would expose saved repository logs and would let visitors use your provider quota.
+For manual deployment, build with `npm run build`, publish `static`, and deploy the Netlify Functions in `netlify/functions`. Configure the required site services and secrets before expecting hosted analysis to work. This is a public service with no account login, so anyone can open it and submit their own provider and GitHub keys; protect secret environment variables, use HTTPS, and keep data isolated by the browser session. Repository webhook delivery is optional and requires `GITHUB_WEBHOOK_SECRET`.
 
 ## Checks and safeguards
 

@@ -25,9 +25,9 @@ export default async function handler(request) {
   if (run.status !== "completed" || run.conclusion !== "failure") return json({ accepted: true, ignored: "run is not a completed failure" }, 202);
 
   const mapping = await readJson(repoKey(repository));
-  if (!mapping?.userId) return json({ accepted: true, ignored: "repository is not connected" }, 202);
+  if (!mapping?.sessionId) return json({ accepted: true, ignored: "repository is not connected" }, 202);
   const runId = String(run.id);
-  const key = analysisKey(mapping.userId, runId);
+  const key = analysisKey(mapping.sessionId, runId);
   const existing = await readJson(key);
   if (existing) return json({ accepted: true, duplicate: true, run_id: runId }, 202);
 
@@ -43,21 +43,21 @@ export default async function handler(request) {
 
   const jobSecret = process.env.BACKGROUND_JOB_SECRET || "";
   if (!jobSecret) {
-    await updateAnalysis(mapping.userId, runId, { status: "error", error: "The site's background processing secret is not configured." });
+    await updateAnalysis(mapping.sessionId, runId, { status: "error", error: "The site's background processing secret is not configured." });
     return json({ detail: "The analysis service is not fully configured." }, 503);
   }
   try {
     const backgroundUrl = new URL("/.netlify/functions/analyze-failure-background", request.url);
     const response = await fetch(backgroundUrl, {
       method: "POST", headers: { "content-type": "application/json", "x-background-job-secret": jobSecret },
-      body: JSON.stringify({ userId: mapping.userId, runId }), signal: AbortSignal.timeout(12000),
+      body: JSON.stringify({ sessionId: mapping.sessionId, runId }), signal: AbortSignal.timeout(12000),
     });
     if (response.status !== 202) {
-      await updateAnalysis(mapping.userId, runId, { status: "error", error: "The background analysis service did not accept this run." });
+      await updateAnalysis(mapping.sessionId, runId, { status: "error", error: "The background analysis service did not accept this run." });
       return json({ detail: "Could not start workflow analysis." }, 503);
     }
   } catch {
-    await updateAnalysis(mapping.userId, runId, { status: "error", error: "The background analysis service could not be reached." });
+    await updateAnalysis(mapping.sessionId, runId, { status: "error", error: "The background analysis service could not be reached." });
     return json({ detail: "Could not start workflow analysis." }, 503);
   }
   return json({ accepted: true, run_id: runId }, 202);

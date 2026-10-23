@@ -3,11 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node --check netlify/functions/api.mjs && node --check netlify/functions/github-webhook.mjs && node --check netlify/functions/analyze-failure-background.mjs && node --check netlify/functions/lib.js && esbuild client/auth-client.js --bundle --platform=browser --format=esm --outfile=static/auth-client.js"
+    "build": "node --check netlify/functions/api.mjs && node --check netlify/functions/github-webhook.mjs && node --check netlify/functions/analyze-failure-background.mjs && node --check netlify/functions/lib.js"
   },
   "dependencies": {
     "@netlify/blobs": "^11.1.6",
-    "@netlify/identity": "^2.0.0",
     "esbuild": "^0.27.0",
     "fflate": "^0.8.3"
   }

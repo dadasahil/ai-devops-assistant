@@ -1,6 +1,5 @@
 import { getStore } from "@netlify/blobs";
-import { getUser } from "@netlify/identity";
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
@@ -13,13 +12,29 @@ export function json(data, status = 200, headers = {}) {
   });
 }
 
-export async function requireUser() {
-  try {
-    const user = await getUser();
-    return user?.id ? user : null;
-  } catch {
-    return null;
-  }
+const SESSION_COOKIE = "devops_session";
+
+function sessionToken(request) {
+  const cookie = request.headers.get("cookie") || "";
+  const pair = cookie.split(";").map(item => item.trim()).find(item => item.startsWith(`${SESSION_COOKIE}=`));
+  const token = pair?.slice(SESSION_COOKIE.length + 1) || "";
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token) || Buffer.from(token, "base64url").length !== 32) return "";
+  return token;
+}
+
+export function sessionIdFromRequest(request) {
+  const token = sessionToken(request);
+  return token ? createHash("sha256").update(token).digest("hex") : "";
+}
+
+export function issueSession(request) {
+  const existing = sessionToken(request);
+  const token = existing || randomBytes(32).toString("base64url");
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return {
+    id: createHash("sha256").update(token).digest("hex"),
+    cookie: existing ? "" : `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000${secure}`,
+  };
 }
 
 function encryptionKey() {
@@ -59,12 +74,12 @@ export function repoKey(repository) {
   return `repositories/${repository.toLowerCase()}`;
 }
 
-export function userConfigKey(userId) {
-  return `users/${userId}/connections`;
+export function sessionConfigKey(sessionId) {
+  return `sessions/${sessionId}/connections`;
 }
 
-export function analysisKey(userId, runId) {
-  return `analyses/${userId}/${runId}`;
+export function analysisKey(sessionId, runId) {
+  return `analyses/${sessionId}/${runId}`;
 }
 
 export function isRepoName(value) {
@@ -157,8 +172,8 @@ export function shouldKeepAISettings(result) {
   return result?.connected === true || ["rate_limited", "quota_exhausted", "provider_unavailable"].includes(aiConnectionStatus(false, result?.message));
 }
 
-export async function getConfig(userId) {
-  const stored = await readJson(userConfigKey(userId));
+export async function getConfig(sessionId) {
+  const stored = await readJson(sessionConfigKey(sessionId));
   const defaultProvider = process.env.AI_PROVIDER || (process.env.LLM_BASE_URL ? inferAIProvider(process.env.LLM_BASE_URL) : "gemini");
   if (!stored) return { githubToken: "", aiKey: "", repository: "", aiProvider: defaultProvider,
     aiBaseUrl: process.env.LLM_BASE_URL || defaultAIBaseUrl(defaultProvider),
@@ -175,8 +190,8 @@ export async function getConfig(userId) {
   };
 }
 
-export async function saveConfig(userId, config) {
-  await writeJson(userConfigKey(userId), {
+export async function saveConfig(sessionId, config) {
+  await writeJson(sessionConfigKey(sessionId), {
     githubToken: config.githubToken ? encrypt(config.githubToken) : "",
     aiKey: config.aiKey ? encrypt(config.aiKey) : "",
     repository: config.repository || "",
@@ -189,14 +204,14 @@ export async function saveConfig(userId, config) {
   });
 }
 
-export async function listAnalyses(userId, limit = 100) {
-  const { blobs = [] } = await store.list({ prefix: `analyses/${userId}/` });
+export async function listAnalyses(sessionId, limit = 100) {
+  const { blobs = [] } = await store.list({ prefix: `analyses/${sessionId}/` });
   const rows = await Promise.all(blobs.map(async ({ key }) => readJson(key)));
   return rows.filter(Boolean).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)).slice(0, limit);
 }
 
-export async function updateAnalysis(userId, runId, updates) {
-  const key = analysisKey(userId, runId);
+export async function updateAnalysis(sessionId, runId, updates) {
+  const key = analysisKey(sessionId, runId);
   const row = await readJson(key);
   if (!row) return null;
   const updated = { ...row, ...updates };

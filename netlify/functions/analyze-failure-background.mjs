@@ -96,18 +96,18 @@ export default async function handler(request) {
   if (!secureEqual(request.headers.get("x-background-job-secret"), expectedSecret)) return new Response(null, { status: 401 });
   let job;
   try { job = await request.json(); } catch { return new Response(null, { status: 400 }); }
-  const userId = String(job?.userId || "");
+  const sessionId = String(job?.sessionId || "");
   const runId = String(job?.runId || "");
-  if (!userId || !/^\d+$/.test(runId)) return new Response(null, { status: 400 });
-  const record = await readJson(analysisKey(userId, runId));
+  if (!sessionId || !/^\d+$/.test(runId)) return new Response(null, { status: 400 });
+  const record = await readJson(analysisKey(sessionId, runId));
   if (!record) return new Response(null, { status: 404 });
 
   let logExcerpt = "";
   let jobSummaries = [];
   let stage = "github";
   try {
-    await updateAnalysis(userId, runId, { status: "running", error: null });
-    const config = await getConfig(userId);
+    await updateAnalysis(sessionId, runId, { status: "running", error: null });
+    const config = await getConfig(sessionId);
     if (!config.githubToken || !config.aiKey || config.repository.toLowerCase() !== record.repository.toLowerCase()) {
       throw new Error("Reconnect the GitHub and AI services for this repository, then send a new failed run.");
     }
@@ -141,12 +141,12 @@ export default async function handler(request) {
     logExcerpt = chunks.join("\n\n").slice(0, 18000) || "GitHub returned an empty log archive.";
     stage = "ai";
     const diagnosis = await makeDiagnosis(record, jobSummaries, logExcerpt, config.aiKey, config.aiProvider, config.aiBaseUrl, config.aiModel);
-    await updateAnalysis(userId, runId, {
+    await updateAnalysis(sessionId, runId, {
       status: "complete", summary: diagnosis.summary.trim(), likely_causes: JSON.stringify([diagnosis.cause.trim()]),
       evidence: JSON.stringify(evidenceLines(logExcerpt)), suggested_fix: diagnosis.fix.trim(), verification_steps: JSON.stringify([]),
       uncertainty: "", error: null,
     });
-    await saveAnalysisAIStatus(userId, config, true, `Connected to ${config.aiProvider} (${config.aiModel}); diagnosis succeeded.`);
+    await saveAnalysisAIStatus(sessionId, config, true, `Connected to ${config.aiProvider} (${config.aiModel}); diagnosis succeeded.`);
   } catch (error) {
     const message = stage === "ai" ? (error?.message || "The AI provider could not complete the diagnosis.")
       : Number(error?.status) === 401 ? "GitHub rejected the saved token. Reconnect it with Actions: Read-only access."
@@ -155,8 +155,8 @@ export default async function handler(request) {
             : error?.message || "Could not retrieve this workflow's GitHub logs.";
     const fallbackResult = fallbackDiagnosis(jobSummaries, logExcerpt, message);
     const status = logExcerpt ? "partial" : "error";
-    if (stage === "ai") await saveAnalysisAIStatus(userId, config, false, message);
-    await updateAnalysis(userId, runId, {
+    if (stage === "ai") await saveAnalysisAIStatus(sessionId, config, false, message);
+    await updateAnalysis(sessionId, runId, {
       status, error: message, summary: fallbackResult.summary,
       likely_causes: JSON.stringify([fallbackResult.cause]), evidence: JSON.stringify(evidenceLines(logExcerpt)),
       suggested_fix: fallbackResult.fix, verification_steps: JSON.stringify([]), uncertainty: fallbackResult.uncertainty,
@@ -167,6 +167,6 @@ export default async function handler(request) {
 
 export const config = { background: true };
 
-async function saveAnalysisAIStatus(userId, config, verified, message) {
-  await saveConfig(userId, { ...config, aiVerified: verified, aiMessage: message });
+async function saveAnalysisAIStatus(sessionId, config, verified, message) {
+  await saveConfig(sessionId, { ...config, aiVerified: verified, aiMessage: message });
 }

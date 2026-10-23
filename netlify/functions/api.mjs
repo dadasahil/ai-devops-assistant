@@ -1,9 +1,14 @@
-import { verifyRequestOrigin } from "@netlify/identity";
 import {
   analysisKey, aiConnectionStatus, getConfig, isRepoName, json, listAnalyses, listGithubRepositories, readJson,
-  repoKey, requireUser, saveConfig, store, updateAnalysis, verifyAIKey, verifyGithubToken, writeJson,
+  issueSession, repoKey, sessionIdFromRequest, saveConfig, store, updateAnalysis, verifyAIKey, verifyGithubToken, writeJson,
   shouldKeepAISettings,
 } from "./lib.js";
+
+function verifyRequestOrigin(request) {
+  const origin = request.headers.get("origin");
+  const site = request.headers.get("sec-fetch-site");
+  if (origin !== new URL(request.url).origin || (site && site !== "same-origin")) throw new Error("Cross-origin request rejected.");
+}
 
 function apiPath(request) {
   const path = new URL(request.url).pathname;
@@ -13,17 +18,23 @@ function apiPath(request) {
 }
 
 export default async function handler(request) {
-  const user = await requireUser();
-  if (!user) return json({ detail: "Please sign in to use your private dashboard." }, 401);
   const path = apiPath(request);
 
+  if (request.method === "GET" && path === "/session") {
+    const session = issueSession(request);
+    return json({ ready: true }, 200, session.cookie ? { "set-cookie": session.cookie } : {});
+  }
+
+  const sessionId = sessionIdFromRequest(request);
+  if (!sessionId) return json({ detail: "Could not start a private browser session. Reload and try again." }, 401);
+
   if (request.method === "GET" && path === "/analyses") {
-    return json(await listAnalyses(user.id));
+    return json(await listAnalyses(sessionId));
   }
 
   if (request.method === "POST" && path === "/refresh") {
     try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
-    const config = await getConfig(user.id);
+    const config = await getConfig(sessionId);
     if (!config.githubToken || !config.repository) return json({ detail: "Connect GitHub Actions access and choose a repository before refreshing." }, 400);
     let response;
     try {
@@ -46,7 +57,7 @@ export default async function handler(request) {
       if (newRecords >= 10) break;
       const runId = String(run.id || "");
       if (!/^\d+$/.test(runId)) continue;
-      const key = analysisKey(user.id, runId);
+      const key = analysisKey(sessionId, runId);
       if (await readJson(key)) continue;
       const record = {
         repository: config.repository, repository_id: null, run_id: Number(runId),
@@ -60,7 +71,7 @@ export default async function handler(request) {
       newRecords += 1;
       const jobSecret = process.env.BACKGROUND_JOB_SECRET || "";
       if (!jobSecret) {
-        await updateAnalysis(user.id, runId, { status: "error", summary: "The failure was found, but analysis is not configured.",
+        await updateAnalysis(sessionId, runId, { status: "error", summary: "The failure was found, but analysis is not configured.",
           likely_causes: JSON.stringify(["The site's background processing secret is missing."]),
           suggested_fix: "Add BACKGROUND_JOB_SECRET to the site's environment settings, redeploy, then retry this saved diagnosis.",
           error: "The site's background processing secret is not configured." });
@@ -70,12 +81,12 @@ export default async function handler(request) {
         const workerUrl = new URL("/.netlify/functions/analyze-failure-background", request.url);
         const worker = await fetch(workerUrl, {
           method: "POST", headers: { "content-type": "application/json", "x-background-job-secret": jobSecret },
-          body: JSON.stringify({ userId: user.id, runId }), signal: AbortSignal.timeout(12000),
+          body: JSON.stringify({ sessionId, runId }), signal: AbortSignal.timeout(12000),
         });
         if (worker.status !== 202) throw new Error("The background analyzer did not accept the run.");
         queued += 1;
       } catch {
-        await updateAnalysis(user.id, runId, { status: "error", summary: "The failure was found, but analysis could not start.",
+        await updateAnalysis(sessionId, runId, { status: "error", summary: "The failure was found, but analysis could not start.",
           likely_causes: JSON.stringify(["The background analysis service could not be reached."]),
           suggested_fix: "Check the site's BACKGROUND_JOB_SECRET setting and retry this saved diagnosis.",
           error: "The background analysis service could not be reached." });
@@ -86,7 +97,7 @@ export default async function handler(request) {
 
   if (request.method === "GET" && path === "/settings/connections") {
     try {
-      const config = await getConfig(user.id);
+      const config = await getConfig(sessionId);
       const ai = config.aiKey
         ? { configured: true, connected: config.aiVerified, status: aiConnectionStatus(config.aiVerified, config.aiMessage), provider: config.aiProvider, model: config.aiModel,
             message: config.aiMessage || "AI key is saved but has not been verified. Click Check AI to test it." }
@@ -119,7 +130,7 @@ export default async function handler(request) {
     let body;
     try { body = await request.json(); } catch { return json({ detail: "Enter the keys and repository in their matching fields." }, 400); }
     try {
-      const old = await getConfig(user.id);
+      const old = await getConfig(sessionId);
       const aiKey = String(body.ai_key || "").trim() || old.aiKey;
       const githubToken = String(body.github_token || "").trim() || old.githubToken;
       const aiProvider = String(body.ai_provider || old.aiProvider).trim().toLowerCase();
@@ -157,14 +168,14 @@ export default async function handler(request) {
         aiVerified: ai.connected ? true : (keepAI ? false : old.aiVerified),
         aiMessage: keepAI ? ai.message : old.aiMessage,
       };
-      if (keepAI || github.connected || (aiKey === old.aiKey && aiProvider === old.aiProvider && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel)) await saveConfig(user.id, newConfig);
+      if (keepAI || github.connected || (aiKey === old.aiKey && aiProvider === old.aiProvider && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel)) await saveConfig(sessionId, newConfig);
 
       if (github.connected) {
         if (old.repository && old.repository.toLowerCase() !== repository.toLowerCase()) {
           const oldMapping = await readJson(repoKey(old.repository));
-          if (oldMapping?.userId === user.id) await store.delete(repoKey(old.repository));
+          if (oldMapping?.sessionId === sessionId) await store.delete(repoKey(old.repository));
         }
-        await writeJson(repoKey(repository), { userId: user.id, repository, updatedAt: new Date().toISOString() });
+        await writeJson(repoKey(repository), { sessionId, repository, updatedAt: new Date().toISOString() });
       }
 
       const responseAI = { ...ai, configured: Boolean(newConfig.aiKey), status: aiConnectionStatus(ai.connected, ai.message), saved: keepAI };
@@ -179,11 +190,11 @@ export default async function handler(request) {
   if (request.method === "POST" && path === "/settings/ai/check") {
     try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
     try {
-      const config = await getConfig(user.id);
+      const config = await getConfig(sessionId);
       if (!config.aiKey) return json({ configured: false, connected: false, status: "not_configured", message: "No AI provider key is saved." });
       const result = await verifyAIKey(config.aiKey, config.aiProvider, config.aiBaseUrl, config.aiModel);
       const updated = { ...config, aiVerified: result.connected, aiMessage: result.message };
-      await saveConfig(user.id, updated);
+      await saveConfig(sessionId, updated);
       return json({ ...result, configured: true, provider: config.aiProvider, model: config.aiModel,
         status: aiConnectionStatus(result.connected, result.message), saved: shouldKeepAISettings(result) });
     } catch (error) {
@@ -194,8 +205,8 @@ export default async function handler(request) {
   if (request.method === "DELETE" && path === "/settings/ai") {
     try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
     try {
-      const config = await getConfig(user.id);
-      await saveConfig(user.id, { ...config, aiKey: "", aiVerified: false, aiMessage: "No AI provider key is saved." });
+      const config = await getConfig(sessionId);
+      await saveConfig(sessionId, { ...config, aiKey: "", aiVerified: false, aiMessage: "No AI provider key is saved." });
       return json({ disconnected: true, ai: { configured: false, connected: false, status: "not_configured", message: "No AI provider key is saved." } });
     } catch (error) {
       return json({ detail: error.message || "Could not disconnect the AI provider key." }, 500);
@@ -205,12 +216,12 @@ export default async function handler(request) {
   if (request.method === "DELETE" && path === "/settings/connections") {
     try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
     try {
-      const config = await getConfig(user.id);
+      const config = await getConfig(sessionId);
       if (config.repository) {
         const mapping = await readJson(repoKey(config.repository));
-        if (mapping?.userId === user.id) await store.delete(repoKey(config.repository));
+        if (mapping?.sessionId === sessionId) await store.delete(repoKey(config.repository));
       }
-      await store.delete(`users/${user.id}/connections`);
+      await store.delete(`sessions/${sessionId}/connections`);
       return json({ disconnected: true, history_kept: true });
     } catch (error) {
       return json({ detail: error.message || "Could not disconnect the saved keys." }, 500);
@@ -221,9 +232,9 @@ export default async function handler(request) {
   if (retryMatch) {
     try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
     const runId = retryMatch[1];
-    const record = await readJson(analysisKey(user.id, runId));
+    const record = await readJson(analysisKey(sessionId, runId));
     if (!record) return json({ detail: "This saved workflow run was not found." }, 404);
-    const config = await getConfig(user.id);
+    const config = await getConfig(sessionId);
     if (!config.githubToken || !config.aiKey) return json({ detail: "Connect GitHub Actions and an AI provider before retrying." }, 400);
     if (config.repository.toLowerCase() !== String(record.repository || "").toLowerCase()) {
       return json({ detail: `This run belongs to ${record.repository}. Reconnect that repository before retrying.` }, 400);
@@ -231,16 +242,16 @@ export default async function handler(request) {
     if (["queued", "running"].includes(record.status)) return json({ accepted: true, run_id: runId, status: record.status }, 202);
     const jobSecret = process.env.BACKGROUND_JOB_SECRET || "";
     if (!jobSecret) return json({ detail: "The site's background processing secret is not configured." }, 503);
-    await writeJson(analysisKey(user.id, runId), { ...record, status: "queued", error: null });
+    await writeJson(analysisKey(sessionId, runId), { ...record, status: "queued", error: null });
     try {
       const workerUrl = new URL("/.netlify/functions/analyze-failure-background", request.url);
       const response = await fetch(workerUrl, {
         method: "POST", headers: { "content-type": "application/json", "x-background-job-secret": jobSecret },
-        body: JSON.stringify({ userId: user.id, runId }), signal: AbortSignal.timeout(12000),
+        body: JSON.stringify({ sessionId, runId }), signal: AbortSignal.timeout(12000),
       });
       if (response.status !== 202) throw new Error("The background analyzer did not accept the retry.");
     } catch {
-      await updateAnalysis(user.id, runId, { status: "error", error: "Could not start the background analysis. Try again." });
+      await updateAnalysis(sessionId, runId, { status: "error", error: "Could not start the background analysis. Try again." });
       return json({ detail: "Could not start the analysis retry." }, 503);
     }
     return json({ accepted: true, run_id: runId, status: "queued" }, 202);
