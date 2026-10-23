@@ -71,11 +71,15 @@ export function isRepoName(value) {
 
 export async function getConfig(userId) {
   const stored = await readJson(userConfigKey(userId));
-  if (!stored) return { githubToken: "", aiKey: "", repository: "" };
+  if (!stored) return { githubToken: "", aiKey: "", repository: "", aiBaseUrl: process.env.LLM_BASE_URL || "https://api.openai.com/v1", aiModel: process.env.LLM_MODEL || "gpt-4o-mini", aiVerified: false, aiMessage: "No AI provider key is saved." };
   return {
     githubToken: decrypt(stored.githubToken || ""),
     aiKey: decrypt(stored.aiKey || ""),
     repository: stored.repository || "",
+    aiBaseUrl: stored.aiBaseUrl || process.env.LLM_BASE_URL || "https://api.openai.com/v1",
+    aiModel: stored.aiModel || process.env.LLM_MODEL || "gpt-4o-mini",
+    aiVerified: stored.aiVerified === true,
+    aiMessage: stored.aiMessage || "AI key is saved but has not been verified. Click Connect both to test it.",
   };
 }
 
@@ -84,6 +88,10 @@ export async function saveConfig(userId, config) {
     githubToken: config.githubToken ? encrypt(config.githubToken) : "",
     aiKey: config.aiKey ? encrypt(config.aiKey) : "",
     repository: config.repository || "",
+    aiBaseUrl: config.aiBaseUrl || process.env.LLM_BASE_URL || "https://api.openai.com/v1",
+    aiModel: config.aiModel || process.env.LLM_MODEL || "gpt-4o-mini",
+    aiVerified: config.aiVerified === true,
+    aiMessage: config.aiMessage || "",
     updatedAt: new Date().toISOString(),
   });
 }
@@ -118,21 +126,50 @@ export function redact(text) {
     .replace(/(authorization\s*:\s*bearer\s+)\S+/gi, "$1[REDACTED]")
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\b(sk-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,})\b/g, "[REDACTED_API_KEY]")
+    .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED_API_KEY]")
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]")
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED_SLACK_TOKEN]")
     .replace(/(\b(?:password|passwd|secret|api[_-]?key|token)\b\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/\b[A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API_KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*[^\s]+/gi, "[REDACTED_SECRET_VARIABLE]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]");
 }
 
-export async function verifyAIKey(apiKey) {
-  if (!apiKey) return { connected: false, message: "No OpenAI API key is saved." };
+export async function verifyAIKey(apiKey, baseUrl = process.env.LLM_BASE_URL || "https://api.openai.com/v1", model = process.env.LLM_MODEL || "gpt-4o-mini") {
+  if (!apiKey) return { connected: false, message: "No AI provider API key is saved." };
+  let endpoint;
   try {
-    const response = await fetch("https://api.openai.com/v1/models", {
-      headers: { authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
-    });
-    if (response.ok) return { connected: true, message: "Connected to OpenAI (gpt-4o-mini)." };
-    const status = response.status;
-    return { connected: false, message: status === 401 ? "OpenAI rejected this key. Check that it is valid and active." : status === 429 ? "OpenAI has no available quota or is rate-limiting requests. Check API billing." : `OpenAI could not verify this key (HTTP ${status}).` };
+    const parsed = new URL(baseUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("Invalid URL");
+    endpoint = parsed.toString().replace(/\/$/, "");
   } catch {
-    return { connected: false, message: "Could not reach OpenAI. Check your internet connection and try again." };
+    return { connected: false, message: "Enter a valid HTTPS AI API URL." };
+  }
+  if (!model || model.length > 160 || /[\r\n]/.test(model)) return { connected: false, message: "Enter a valid model name." };
+  try {
+    // This one-token probe confirms that the account can actually generate a response.
+    const response = await fetch(`${endpoint}/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ model, temperature: 0, max_tokens: 2, messages: [{ role: "user", content: "Reply OK." }] }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+      let detail = "";
+      try { const data = await response.json(); detail = `${data?.error?.code || ""} ${data?.error?.message || ""}`.toLowerCase(); } catch {}
+      const status = response.status;
+      const message = status === 401 ? "The AI provider rejected this key. Check that it is valid and active."
+        : status === 403 ? "The AI provider denied this key. Check its permissions and account access."
+          : status === 404 ? "The AI endpoint or model was not found. Check the API URL and model name."
+            : status === 429 && /quota|billing|credit|insufficient/.test(detail) ? "The key was accepted, but the AI provider has no available quota or credits. Add credits or use a provider key with available quota."
+              : status === 429 ? "The AI provider is rate-limiting requests. Wait a moment and try again."
+                : status >= 500 ? "The AI provider is temporarily unavailable. Try again later."
+                  : `The AI provider could not verify this connection (HTTP ${status}).`;
+      return { connected: false, message };
+    }
+    const payload = await response.json();
+    if (!payload?.choices?.length) return { connected: false, message: "The AI provider did not return a model response. Check the model name." };
+    return { connected: true, message: `Connected to ${new URL(endpoint).hostname} (${model}); test response succeeded.` };
+  } catch {
+    return { connected: false, message: "Could not reach the AI provider. Check your internet connection and API URL." };
   }
 }
 

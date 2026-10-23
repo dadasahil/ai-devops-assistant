@@ -1,7 +1,7 @@
 import { verifyRequestOrigin } from "@netlify/identity";
 import {
-  getConfig, isRepoName, json, listAnalyses, listGithubRepositories, readJson,
-  repoKey, requireUser, saveConfig, store, verifyAIKey, verifyGithubToken, writeJson,
+  analysisKey, getConfig, isRepoName, json, listAnalyses, listGithubRepositories, readJson,
+  repoKey, requireUser, saveConfig, store, updateAnalysis, verifyAIKey, verifyGithubToken, writeJson,
 } from "./lib.js";
 
 function apiPath(request) {
@@ -20,10 +20,75 @@ export default async function handler(request) {
     return json(await listAnalyses(user.id));
   }
 
+  if (request.method === "POST" && path === "/refresh") {
+    try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
+    const config = await getConfig(user.id);
+    if (!config.githubToken || !config.repository) return json({ detail: "Connect GitHub Actions access and choose a repository before refreshing." }, 400);
+    let response;
+    try {
+      response = await fetch(`https://api.github.com/repos/${config.repository}/actions/runs?per_page=50`, {
+        headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", authorization: `Bearer ${config.githubToken}` },
+        signal: AbortSignal.timeout(25000),
+      });
+    } catch {
+      return json({ detail: "Could not reach GitHub to refresh this repository's workflow runs." }, 502);
+    }
+    if (response.status === 401) return json({ detail: "GitHub rejected the saved token. Reconnect it and try again." }, 400);
+    if ([403, 404].includes(response.status)) return json({ detail: `GitHub denied Actions access to ${config.repository}. Check repository selection and Actions: Read-only permission.` }, 400);
+    if (!response.ok) return json({ detail: `GitHub could not refresh workflow runs (HTTP ${response.status}).` }, 502);
+    let runs;
+    try { runs = (await response.json()).workflow_runs || []; } catch { return json({ detail: "GitHub returned an unreadable workflow list." }, 502); }
+    const failures = runs.filter(run => run.status === "completed" && run.conclusion === "failure");
+    let queued = 0;
+    let newRecords = 0;
+    for (const run of failures) {
+      if (newRecords >= 10) break;
+      const runId = String(run.id || "");
+      if (!/^\d+$/.test(runId)) continue;
+      const key = analysisKey(user.id, runId);
+      if (await readJson(key)) continue;
+      const record = {
+        repository: config.repository, repository_id: null, run_id: Number(runId),
+        workflow: String(run.name || "Workflow").slice(0, 300), branch: run.head_branch || null,
+        commit_sha: run.head_sha || null, run_url: run.html_url || null, status: "queued",
+        conclusion: "failure", created_at: run.updated_at || new Date().toISOString(),
+        summary: null, likely_causes: "[]", evidence: "[]", suggested_fix: null,
+        verification_steps: "[]", uncertainty: null, error: null,
+      };
+      await writeJson(key, record);
+      newRecords += 1;
+      const jobSecret = process.env.BACKGROUND_JOB_SECRET || "";
+      if (!jobSecret) {
+        await updateAnalysis(user.id, runId, { status: "error", summary: "The failure was found, but analysis is not configured.",
+          likely_causes: JSON.stringify(["The site's background processing secret is missing."]),
+          suggested_fix: "Add BACKGROUND_JOB_SECRET to the site's environment settings, redeploy, then retry this saved diagnosis.",
+          error: "The site's background processing secret is not configured." });
+        continue;
+      }
+      try {
+        const workerUrl = new URL("/.netlify/functions/analyze-failure-background", request.url);
+        const worker = await fetch(workerUrl, {
+          method: "POST", headers: { "content-type": "application/json", "x-background-job-secret": jobSecret },
+          body: JSON.stringify({ userId: user.id, runId }), signal: AbortSignal.timeout(12000),
+        });
+        if (worker.status !== 202) throw new Error("The background analyzer did not accept the run.");
+        queued += 1;
+      } catch {
+        await updateAnalysis(user.id, runId, { status: "error", summary: "The failure was found, but analysis could not start.",
+          likely_causes: JSON.stringify(["The background analysis service could not be reached."]),
+          suggested_fix: "Check the site's BACKGROUND_JOB_SECRET setting and retry this saved diagnosis.",
+          error: "The background analysis service could not be reached." });
+      }
+    }
+    return json({ repository: config.repository, failures_found: failures.length, new_analyses_queued: queued });
+  }
+
   if (request.method === "GET" && path === "/settings/connections") {
     try {
       const config = await getConfig(user.id);
-      const ai = await verifyAIKey(config.aiKey);
+      const ai = config.aiKey
+        ? { connected: config.aiVerified, message: config.aiMessage || "AI key is saved but has not been verified. Click Connect both to test it." }
+        : { connected: false, message: "No AI provider key is saved." };
       const discovery = config.githubToken ? await listGithubRepositories(config.githubToken) : { repositories: [], error: null };
       const repositories = discovery.repositories;
       let repository = config.repository;
@@ -41,7 +106,7 @@ export default async function handler(request) {
         : repository
           ? await verifyGithubToken(config.githubToken, repository)
           : { connected: false, message: config.githubToken ? "Choose a repository available to this token." : "No GitHub token is saved." };
-      return json({ ai, github, repository, repositories });
+      return json({ ai, ai_base_url: config.aiBaseUrl, ai_model: config.aiModel, github, repository, repositories });
     } catch (error) {
       return json({ detail: error.message || "Could not read connection settings." }, 500);
     }
@@ -55,10 +120,12 @@ export default async function handler(request) {
       const old = await getConfig(user.id);
       const aiKey = String(body.ai_key || "").trim() || old.aiKey;
       const githubToken = String(body.github_token || "").trim() || old.githubToken;
-      if (aiKey.length > 500 || /[\r\n]/.test(aiKey)) return json({ detail: "The OpenAI key format is invalid." }, 400);
+      const aiBaseUrl = String(body.ai_base_url || old.aiBaseUrl).trim();
+      const aiModel = String(body.ai_model || old.aiModel).trim();
+      if (aiKey.length > 500 || /[\r\n]/.test(aiKey)) return json({ detail: "The AI provider key format is invalid." }, 400);
       if (githubToken.length > 500 || /[\r\n]/.test(githubToken)) return json({ detail: "The GitHub token format is invalid." }, 400);
 
-      const ai = await verifyAIKey(aiKey);
+      const ai = await verifyAIKey(aiKey, aiBaseUrl, aiModel);
       const discovery = githubToken ? await listGithubRepositories(githubToken) : { repositories: [], error: null };
       const repositories = discovery.repositories;
       let repository = String(body.repository || "").trim();
@@ -76,8 +143,12 @@ export default async function handler(request) {
         aiKey: ai.connected ? aiKey : old.aiKey,
         githubToken: github.connected ? githubToken : old.githubToken,
         repository: github.connected ? repository : old.repository,
+        aiBaseUrl: ai.connected ? aiBaseUrl : old.aiBaseUrl,
+        aiModel: ai.connected ? aiModel : old.aiModel,
+        aiVerified: ai.connected ? true : (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel ? false : old.aiVerified),
+        aiMessage: ai.connected ? ai.message : (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel ? ai.message : old.aiMessage),
       };
-      if (ai.connected || github.connected) await saveConfig(user.id, newConfig);
+      if (ai.connected || github.connected || (aiKey === old.aiKey && aiBaseUrl === old.aiBaseUrl && aiModel === old.aiModel)) await saveConfig(user.id, newConfig);
 
       if (github.connected) {
         if (old.repository && old.repository.toLowerCase() !== repository.toLowerCase()) {
@@ -87,7 +158,7 @@ export default async function handler(request) {
         await writeJson(repoKey(repository), { userId: user.id, repository, updatedAt: new Date().toISOString() });
       }
 
-      return json({ ai, github, repository: github.connected ? repository : "", repositories });
+      return json({ ai, ai_base_url: newConfig.aiBaseUrl, ai_model: newConfig.aiModel, github, repository: github.connected ? repository : "", repositories });
     } catch (error) {
       return json({ detail: error.message || "Could not save the connection settings." }, 500);
     }
@@ -106,6 +177,35 @@ export default async function handler(request) {
     } catch (error) {
       return json({ detail: error.message || "Could not disconnect the saved keys." }, 500);
     }
+  }
+
+  const retryMatch = request.method === "POST" && path.match(/^\/analyses\/(\d+)\/retry$/);
+  if (retryMatch) {
+    try { verifyRequestOrigin(request); } catch { return json({ detail: "This request did not come from this website. Reload and try again." }, 403); }
+    const runId = retryMatch[1];
+    const record = await readJson(analysisKey(user.id, runId));
+    if (!record) return json({ detail: "This saved workflow run was not found." }, 404);
+    const config = await getConfig(user.id);
+    if (!config.githubToken || !config.aiKey) return json({ detail: "Connect both GitHub Actions access and an AI provider before retrying." }, 400);
+    if (config.repository.toLowerCase() !== String(record.repository || "").toLowerCase()) {
+      return json({ detail: `This run belongs to ${record.repository}. Reconnect that repository before retrying.` }, 400);
+    }
+    if (["queued", "running"].includes(record.status)) return json({ accepted: true, run_id: runId, status: record.status }, 202);
+    const jobSecret = process.env.BACKGROUND_JOB_SECRET || "";
+    if (!jobSecret) return json({ detail: "The site's background processing secret is not configured." }, 503);
+    await writeJson(analysisKey(user.id, runId), { ...record, status: "queued", error: null });
+    try {
+      const workerUrl = new URL("/.netlify/functions/analyze-failure-background", request.url);
+      const response = await fetch(workerUrl, {
+        method: "POST", headers: { "content-type": "application/json", "x-background-job-secret": jobSecret },
+        body: JSON.stringify({ userId: user.id, runId }), signal: AbortSignal.timeout(12000),
+      });
+      if (response.status !== 202) throw new Error("The background analyzer did not accept the retry.");
+    } catch {
+      await updateAnalysis(user.id, runId, { status: "error", error: "Could not start the background analysis. Try again." });
+      return json({ detail: "Could not start the analysis retry." }, 503);
+    }
+    return json({ accepted: true, run_id: runId, status: "queued" }, 202);
   }
 
   return json({ detail: "Not Found" }, 404);
